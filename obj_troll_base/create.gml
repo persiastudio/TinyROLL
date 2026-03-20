@@ -12,7 +12,7 @@ image_yscale = obj_tinyroll_background.image_yscale;
 	
 instance_create_layer(x + 4, y + 86, BmLayer[Box + 1], obj_troll_vid_selector, {context: 0, Layer: Layer, Box: Box + 1});
 
-/*	x + 5, y + 86. Todo o resto segue x + 5, mas o y que muda. Cada objeto desse
+/*	x + 4, y + 86. Todo o resto segue x + 4, mas o y que muda. Cada objeto desse
 	tem 68 de altura, então, você já sabe a base pra calcular. Ah, esse objeto aqui
 	tem 647 de altura sem scaling, mas como vc viu, os objetos vid_selector começam
 	a partir do y + 86. Por que? Ah, porque tem o logo do TinyROLL, então depois desse
