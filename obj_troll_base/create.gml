@@ -10,7 +10,7 @@ image_yscale = obj_tinyroll_background.image_yscale;
 	O primeiro precisa ser criado em: 
 	*/
 	
-instance_create_layer(x + 5, y + 86, BmLayer[Box + 1], obj_troll_vid_selector, {context: 0, Layer: Layer, Box: Box});
+instance_create_layer(x + 5, y + 86, BmLayer[Box + 2], obj_troll_vid_selector, {context: 0, Layer: Layer, Box: Box});
 
 /*	x + 5, y + 86. Todo o resto segue x + 5, mas o y que muda. Cada objeto desse
 	tem 68 de altura, então, você já sabe a base pra calcular. Ah, esse objeto aqui
