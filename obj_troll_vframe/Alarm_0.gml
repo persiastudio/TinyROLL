@@ -1,0 +1,1 @@
+instance_create_layer(obj_troll_vframe.x + 4, obj_troll_vframe.y - obj_troll_vframe.sprite_height / 2 + 4, BmLayer[Box + 2], obj_troll_core, {v_path: v_path, Box: Box + 2, Layer: Layer});

@@ -1,0 +1,1 @@
+obj_troll_core.fullscreen = !obj_troll_core.fullscreen;
