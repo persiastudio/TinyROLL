@@ -1,1 +1,1 @@
-obj_troll_core.fullscreen = !obj_troll_core.fullscreen;
+TROLL_CFG_FScrn = !TROLL_CFG_FScrn;

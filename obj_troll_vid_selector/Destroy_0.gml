@@ -1,1 +1,1 @@
-instance_destroy(obj_troll_thumb);
+instance_destroy(thumb_inst);

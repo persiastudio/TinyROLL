@@ -1,5 +1,5 @@
-switch(obj_troll_core.status)
+switch(TROLL_STT_Stats)
 {
-	case video_status_playing: obj_troll_core.pause = 1; break;
-	case video_status_paused : obj_troll_core.play  = 1; break;
+    case video_status_playing: TROLL_CMD_Pause  = 1; break;
+    case video_status_paused:  TROLL_CMD_VPlay  = 1; break;
 }

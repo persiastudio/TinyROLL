@@ -1,23 +1,12 @@
-var _data = video_draw();
-if (!_data[0] && status == video_status_playing)
+var data = video_draw();
+if (!data[0] && TROLL_STT_Stats == video_status_playing)
 {
-    var _surface = _data[1];
-    var _w = surface_get_width(_surface);
-    var _h = surface_get_height(_surface);
-	gpu_set_tex_filter(aniso);
-	switch(fullscreen)
-	{
-		case 0: draw_surface_stretched
-		(
-			_surface, x, y, 
-			obj_troll_vframe.sprite_width - 8, obj_troll_vframe.sprite_height - 8
-		);	break;
-		
-		case 1: draw_surface_stretched
-		(
-			_surface, BsmLeft, BsmtTop, 
-			BsWidth, BHeight
-		);	break;
-	}
-	gpu_set_tex_filter(0);
+    var surf = data[1];
+    gpu_set_tex_filter(TROLL_CFG_Aniso);
+    switch(TROLL_CFG_FScrn)
+    {
+        case 0: tinyroll_draw_letterbox(surf, x, y, obj_troll_vframe.sprite_width - 8, obj_troll_vframe.sprite_height - 8); break;
+        case 1: tinyroll_draw_letterbox(surf, BsmLeft, BsmtTop, BsWidth, BHeight); break;
+    }
+    gpu_set_tex_filter(0);
 }

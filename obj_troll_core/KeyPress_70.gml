@@ -1,1 +1,1 @@
-fullscreen = !fullscreen;
+TROLL_CFG_FScrn = !TROLL_CFG_FScrn;
