@@ -6,3 +6,4 @@ obj_troll_vframe.changed = 1;
 TROLL_STT_VPath = base.videos[context].path;
 TROLL_STT_VName = base.videos[context].name;
 TROLL_STT_VSize = base.videos[context].size;
+TROLL_STT_TTime = base.videos[context].duration;

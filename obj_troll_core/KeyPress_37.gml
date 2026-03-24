@@ -1,0 +1,1 @@
+TROLL_CMD_Rewnd = 1;

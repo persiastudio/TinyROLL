@@ -1,5 +1,8 @@
 var video_folder = game_save_id + UsrPath[LgdUser] + "//Videos";
 trtparser_parse(video_folder);
+show_debug_message("[TRT] video_folder: " + video_folder);
+show_debug_message("[TRT] Parse retornou: " + string(trtparser_parse(video_folder)));
+show_debug_message("[TRT] Thumbs existe: " + string(file_exists(video_folder + "//Thumbs")));
 
 videos        = [];
 scroll_offset = 0;
@@ -22,13 +25,13 @@ file_find_close();
 video_count   = array_length(videos);
 image_yscale  = obj_tinyroll_background.sprite_height / sprite_get_height(sprite_index);
 
-var available_h = (sprite_get_height(sprite_index) - 86) * image_yscale;
-var item_h      = 70 * image_yscale;
+var available_h = (sprite_get_height(sprite_index) * image_yscale) - 80;
+var item_h      = 70;
 visible_count   = floor(available_h / item_h);
 
 for (var i = 0; i < min(visible_count, video_count); i++)
 {
-    var inst = instance_create_layer(x + 4, y + 86 * image_yscale + i * item_h, BmLayer[Box + 1], obj_troll_vid_selector, {context: i, Layer: Layer, Box: Box + 1});
+    var inst = instance_create_layer(x + 4, y + 80 + i * item_h, BmLayer[Box + 1], obj_troll_vid_selector, {context: i, Layer: Layer, Box: Box + 1});
     array_push(selectors, inst);
 }
 

@@ -4,7 +4,7 @@ last_context = -1;
 
 var base      = obj_troll_base;
 var thumb_dir = game_save_id + UsrPath[LgdUser] + "//Videos//Thumbs//";
-var thumb_path = thumb_dir + base.videos[context].name + ".png";
+thumb_path = thumb_dir + base.videos[context].name + ".png";
 
 if file_exists(thumb_path)
 {

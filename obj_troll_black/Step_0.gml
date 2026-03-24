@@ -1,0 +1,1 @@
+visible = TROLL_CFG_FScrn;

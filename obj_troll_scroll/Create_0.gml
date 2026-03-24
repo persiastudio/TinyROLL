@@ -1,2 +1,2 @@
-//Objeto que você clica e arrasta pra rolar a página
-sel = 0;
+sel      = 0;
+dragging = 0;

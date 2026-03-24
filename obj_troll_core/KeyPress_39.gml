@@ -1,0 +1,1 @@
+TROLL_CMD_FFwrd = 1;
