@@ -1,0 +1,1 @@
+thumb_inst.image_index = image_index;
