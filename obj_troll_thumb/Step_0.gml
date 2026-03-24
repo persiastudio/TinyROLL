@@ -1,15 +1,20 @@
-var base       = obj_troll_base;
-var thumb_dir  = game_save_id + UsrPath[LgdUser] + "//Videos//Thumbs//";
-var thumb_path = thumb_dir + base.videos[fid.context].name + ".png";
+if fid.context == last_context { exit; }
+last_context = fid.context;
 
-if thumb_sprite != -1 { sprite_delete(thumb_sprite); }
+var base       = obj_troll_base;
+if fid.context >= array_length(base.videos) { exit; }
+
+var thumb_path = game_save_id + UsrPath[LgdUser] + "//Videos//Thumbs//" + base.videos[fid.context].name + ".png";
+
+if thumb_sprite != -1
+{
+    sprite_index = spr_troll_thumb;
+    sprite_delete(thumb_sprite);
+    thumb_sprite = -1;
+}
 
 if file_exists(thumb_path)
 {
     thumb_sprite = sprite_add(thumb_path, 1, false, false, 0, 0);
     sprite_index = thumb_sprite;
-}
-else
-{
-    sprite_index = spr_troll_thumb;
 }

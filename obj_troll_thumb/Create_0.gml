@@ -1,5 +1,6 @@
 image_speed  = 0;
 thumb_sprite = -1;
+last_context = -1;
 
 var base      = obj_troll_base;
 var thumb_dir = game_save_id + UsrPath[LgdUser] + "//Videos//Thumbs//";
