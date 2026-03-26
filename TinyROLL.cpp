@@ -1,12 +1,12 @@
-// ============================================================================
-// TinyROLL.cpp — Video + Audio player DLL for TinyBox OS (GameMaker 2024.14)
+// ===============================================================================
+// TinyROLL — Video + Audio player DLL for TinyBox OS (GameMaker 2024.14)
 // Media Foundation + WASAPI | Fully autonomous threads
 // Architecture:
 //   - Audio decode thread: reads MF audio samples → ring buffer (self-throttled)
 //   - WASAPI render thread: ring buffer → speakers (master clock)
 //   - Video decode thread:  reads MF video samples, paces to audio clock
 //   - GM only calls: Open/Play/Pause/Seek/Close + reads frame buffer
-// ============================================================================
+// ===============================================================================
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -112,11 +112,9 @@ static std::atomic<int>    g_status{ 0 };     // 0=idle 1=playing 2=paused 3=end
 static std::atomic<bool>   g_loop{ false };
 static std::atomic<double> g_volume{ 1.0 };
 static std::atomic<double> g_position{ 0.0 };
-// Frame buffer: decode thread writes g_backFrame, Tick swaps to g_frontFrame
+// Frame buffer
 static std::vector<BYTE>   g_frontFrame;         // GM reads from here
-static std::vector<BYTE>   g_backFrame;          // decode thread writes here
 static std::mutex          g_frameMutex;
-static std::atomic<bool>   g_frameReady{ false };
 static void* g_targetBuffer = nullptr;
 // Master clock — driven by total audio bytes consumed by WASAPI
 static std::atomic<int64_t> g_audioBytesSent{ 0 }; // bytes pushed to WASAPI
@@ -363,17 +361,15 @@ static void VideoDecodeThreadProc()
 {
     LARGE_INTEGER perfFreq, perfNow;
     QueryPerformanceFrequency(&perfFreq);
-    // Fallback wall clock for video-only files (no audio)
     LARGE_INTEGER wallClockStart;
     QueryPerformanceCounter(&wallClockStart);
     double wallClockOffset = 0.0;
-    bool wallClockActive = false;
+
     while (g_threadsRunning.load())
     {
         if (g_status.load() != 1)
         {
             Sleep(5);
-            // Reset wall clock on unpause
             if (g_status.load() == 1)
             {
                 QueryPerformanceCounter(&wallClockStart);
@@ -381,7 +377,7 @@ static void VideoDecodeThreadProc()
             }
             continue;
         }
-        // ---- Handle seek ----
+
         if (g_seekRequested.load())
         {
             double seekTo = g_seekTarget.load();
@@ -406,7 +402,7 @@ static void VideoDecodeThreadProc()
             g_seekCV.notify_all();
             continue;
         }
-        // ---- Get current playback time ----
+
         double currentTime;
         if (g_hasAudio)
         {
@@ -414,13 +410,12 @@ static void VideoDecodeThreadProc()
         }
         else
         {
-            // No audio: use wall clock
             QueryPerformanceCounter(&perfNow);
             currentTime = wallClockOffset +
                 (double)(perfNow.QuadPart - wallClockStart.QuadPart) / (double)perfFreq.QuadPart;
             g_position.store(currentTime);
         }
-        // ---- Read next video frame ----
+
         DWORD flags = 0, streamIndex = 0;
         LONGLONG timestamp = 0;
         IMFSample* pSample = nullptr;
@@ -435,7 +430,6 @@ static void VideoDecodeThreadProc()
                 if (pSample) pSample->Release();
                 if (g_loop.load())
                 {
-                    // Seek both streams to beginning
                     PROPVARIANT var;
                     PropVariantInit(&var);
                     var.vt = VT_I8;
@@ -450,14 +444,15 @@ static void VideoDecodeThreadProc()
                     QueryPerformanceCounter(&wallClockStart);
                     continue;
                 }
-                g_status.store(3); // ended
+                g_status.store(3);
                 break;
             }
         }
+
         if (pSample)
         {
             double frameTime = (double)timestamp / 10000000.0;
-            // ---- Pace: wait until it's time to show this frame ----
+
             while (g_threadsRunning.load() && g_status.load() == 1 && !g_seekRequested.load())
             {
                 double now;
@@ -473,23 +468,18 @@ static void VideoDecodeThreadProc()
                     g_position.store(now);
                 }
                 double diff = frameTime - now;
-                if (diff <= 0.002) // 2ms tolerance
-                    break;
-                // Sleep proportionally — don't oversleep
-                if (diff > 0.015)
-                    Sleep(5);
-                else if (diff > 0.005)
-                    Sleep(1);
-                else
-                    Sleep(0); // yield
+                if (diff <= 0.002) break;
+                if (diff > 0.015)      Sleep(5);
+                else if (diff > 0.005) Sleep(1);
+                else                   Sleep(0);
             }
-            // If we got interrupted, discard frame
+
             if (!g_threadsRunning.load() || g_seekRequested.load())
             {
                 pSample->Release();
                 continue;
             }
-            // ---- Decode frame pixels ----
+
             IMFMediaBuffer* pBuf = nullptr;
             if (SUCCEEDED(pSample->ConvertToContiguousBuffer(&pBuf)))
             {
@@ -497,18 +487,17 @@ static void VideoDecodeThreadProc()
                 DWORD curLen = 0;
                 if (SUCCEEDED(pBuf->Lock(&pData, nullptr, &curLen)))
                 {
+                    // Escreve direto no frontFrame — sem double-buffer, sem Tick externo
                     std::lock_guard<std::mutex> lock(g_frameMutex);
-                    size_t pixels = (std::min)((size_t)curLen / 4, g_backFrame.size() / 4);
-                    // BGR32 → RGBA swap
+                    size_t pixels = (std::min)((size_t)curLen / 4, g_frontFrame.size() / 4);
                     for (size_t i = 0; i < pixels; i++)
                     {
                         size_t off = i * 4;
-                        g_backFrame[off + 0] = pData[off + 2]; // R
-                        g_backFrame[off + 1] = pData[off + 1]; // G
-                        g_backFrame[off + 2] = pData[off + 0]; // B
-                        g_backFrame[off + 3] = 255;             // A
+                        g_frontFrame[off + 0] = pData[off + 2]; // R
+                        g_frontFrame[off + 1] = pData[off + 1]; // G
+                        g_frontFrame[off + 2] = pData[off + 0]; // B
+                        g_frontFrame[off + 3] = 255;             // A
                     }
-                    g_frameReady.store(true);
                     pBuf->Unlock();
                 }
                 pBuf->Release();
@@ -518,6 +507,7 @@ static void VideoDecodeThreadProc()
         }
     }
 }
+
 // ============================================================================
 // THREAD MANAGEMENT
 // ============================================================================
@@ -569,11 +559,9 @@ static void CloseReader()
     g_position.store(0.0);
     g_status.store(0);
     g_frontFrame.clear();
-    g_backFrame.clear();
     g_audioRing.Clear();
     g_hasVideo = false;
     g_hasAudio = false;
-    g_frameReady.store(false);
     g_seekRequested.store(false);
     g_clockOffset.store(0.0);
     g_audioBytesSent.store(0);
@@ -609,7 +597,6 @@ static bool ConfigureReader(IMFSourceReader* pReader)
             }
             size_t frameBytes = (size_t)g_width * g_height * 4;
             g_frontFrame.resize(frameBytes, 0);
-            g_backFrame.resize(frameBytes, 0);
         }
         else
         {
@@ -816,21 +803,6 @@ TINYROLL_API double DLL_Video_Close()
     MFShutdown();
     CoUninitialize();
     return 1.0;
-}
-// Tick: GM calls this every frame. Only job: swap back→front frame buffer.
-// No decoding, no audio, no pacing — purely a buffer copy.
-TINYROLL_API double DLL_Video_Tick()
-{
-    if (g_frameReady.load())
-    {
-        std::lock_guard<std::mutex> lock(g_frameMutex);
-        if (!g_backFrame.empty() && g_frontFrame.size() == g_backFrame.size())
-        {
-            memcpy(g_frontFrame.data(), g_backFrame.data(), g_frontFrame.size());
-        }
-        g_frameReady.store(false);
-    }
-    return (g_status.load() == 1) ? 1.0 : 0.0;
 }
 TINYROLL_API double DLL_Video_SetTargetBuffer(const char* ptr)
 {
