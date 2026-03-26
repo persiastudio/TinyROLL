@@ -1,3 +1,4 @@
+if (krnl_check_blocking() || !krnl_box_get_active(krnl_guess_box(Box)) || TROLL_CFG_FScrn){exit;}
 image_index = 2;
 var base = obj_troll_base;
 obj_troll_vframe.v_path  = base.videos[context].path;

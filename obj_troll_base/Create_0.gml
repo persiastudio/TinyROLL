@@ -1,22 +1,23 @@
-var video_folder = game_save_id + UsrPath[LgdUser] + "//Videos";
-trtparser_parse(video_folder);
-show_debug_message("[TRT] video_folder: " + video_folder);
-show_debug_message("[TRT] Parse retornou: " + string(trtparser_parse(video_folder)));
-show_debug_message("[TRT] Thumbs existe: " + string(file_exists(video_folder + "//Thumbs")));
+show_debug_message("[PATH] game_save_id: " + game_save_id);
+show_debug_message("[PATH] UsrPath: " + UsrPath[LgdUser]);
+var video_folder = game_save_id + UsrPath[LgdUser] + "\\Videos";
+tinyroll_parse_thumbs(video_folder);
 
 videos        = [];
 scroll_offset = 0;
 selectors     = [];
 
-var f = file_find_first(video_folder + "//*.mp4", 0);
+var f = file_find_first(video_folder + "\\*.mp4", 0);
 while (f != "")
 {
-    var full_path = video_folder + "//" + f;
-    array_push(videos, {
-        path     : full_path,
-        name     : filename_change_ext(f, ""),
-        size     : trtparser_get_filesize(full_path),
-        duration : trtparser_get_duration(full_path)
+    var full_path = video_folder + "\\" + f;
+	show_debug_message("[TinyROLL] Parsed: " + f);
+    array_push(videos, 
+	{
+        path    : full_path						  ,
+        name    : filename_change_ext  (f, ""	 ),
+        size    : tinyroll_get_filesize(full_path),
+        duration: tinyroll_get_duration(full_path)
     });
     f = file_find_next();
 }

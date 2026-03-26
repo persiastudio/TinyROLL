@@ -1,3 +1,4 @@
+if (krnl_check_blocking() || !krnl_box_get_active(krnl_guess_box(Box)) || TROLL_CFG_FScrn){exit;}
 image_index = ThmGrID mod 3;
 switch(TROLL_CFG_FScrn)
 {
@@ -6,6 +7,7 @@ switch(TROLL_CFG_FScrn)
 }
 switch(TROLL_STT_Stats)
 {
-    case video_status_playing: if sel == 0 { visible = 0; } else { visible = 1; } sprite_index = spr_troll_playbutton;  break;
-    case video_status_paused:  sprite_index = spr_troll_pausebutton; visible = 1; break;
+    case 0: visible = 1; sprite_index = spr_troll_playbutton;  break;
+	case 1: if sel == 0 { visible = 0; } else { visible = 1; } sprite_index = spr_troll_playbutton;  break;
+    case 2: sprite_index = spr_troll_pausebutton; visible = 1; break;
 }
