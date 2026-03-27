@@ -184,7 +184,7 @@ static std::atomic<bool> g_seekFlushing{ false };
 static std::mutex              g_seekFlushMutex;
 static std::condition_variable g_seekFlushCV;
 static std::atomic<bool>       g_wasapiIdle{ false };
-
+static std::atomic<bool> g_loopRequested{ false };
 static bool g_strideLogged = false;
 
 // ============================================================================
@@ -360,6 +360,14 @@ static void AudioDecodeThreadProc()
             continue;
         }
 
+        // Reset de drain quando loop acontece
+        if (g_loopRequested.load())
+        {
+            draining = false;
+            drainUntil = 0;
+            g_loopRequested.store(false);
+        }
+
         if (g_seekRequested.load() || g_seekFlushing.load())
         {
             if (g_seekRequested.load())
@@ -395,7 +403,8 @@ static void AudioDecodeThreadProc()
         if (FAILED(hr) || (flags & MF_SOURCE_READERF_ENDOFSTREAM))
         {
             if (pSample) pSample->Release();
-            Sleep(20);
+            // End of stream no áudio — espera o video thread fazer o loop
+            Sleep(5);
             continue;
         }
 
@@ -548,6 +557,7 @@ static void VideoDecodeThreadProc()
                     g_position.store(0.0);
                     wallClockOffset = 0.0;
                     QueryPerformanceCounter(&wallClockStart);
+                    g_loopRequested.store(true); // sinaliza ao audio thread para resetar drain
                     continue;
                 }
                 g_status.store(3);
@@ -759,6 +769,7 @@ static void CloseReader()
     g_seekFlushing.store(false);
     g_wasapiIdle.store(false);
     g_strideLogged = false;
+    g_loopRequested.store(false);
 }
 
 // ============================================================================
