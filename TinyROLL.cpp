@@ -506,6 +506,7 @@ static void VideoDecodeThreadProc()
                 {
                     PROPVARIANT var;
                     PropVariantInit(&var);
+                    var.vt = VT_I8;         // <-- ADICIONAR ESTA LINHA
                     var.hVal.QuadPart = 0;
                     g_pReader->SetCurrentPosition(GUID_NULL, var);
                     PropVariantClear(&var);
