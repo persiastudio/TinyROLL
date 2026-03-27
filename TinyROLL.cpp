@@ -1,11 +1,6 @@
 // ===============================================================================
 // TinyROLL — Video + Audio player DLL for TinyBox OS (GameMaker 2024.14)
 // Media Foundation + WASAPI | Fully autonomous threads
-// Architecture:
-//   - Audio decode thread: reads MF audio samples → ring buffer (self-throttled)
-//   - WASAPI render thread: ring buffer → speakers (master clock)
-//   - Video decode thread:  reads MF video samples, paces to audio clock
-//   - GM only calls: Open/Play/Pause/Seek/Close + reads frame buffer
 // ===============================================================================
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -40,8 +35,9 @@
 #pragma comment(lib, "propsys.lib")
 #pragma warning(disable: 6031)
 #define TINYROLL_API extern "C" __declspec(dllexport)
+
 // ============================================================================
-// AUDIO RING BUFFER (lock-free-ish, single producer single consumer safe)
+// AUDIO RING BUFFER
 // ============================================================================
 class AudioRingBuffer
 {
@@ -95,54 +91,91 @@ private:
     size_t m_head = 0, m_tail = 0, m_count = 0;
     std::mutex m_mtx;
 };
+
+// ============================================================================
+// STRIDE CALCULATOR — handles macroblock-aligned height
+// ============================================================================
+static LONG ComputeStrideFromBuffer(DWORD bufLen, UINT32 width, UINT32 height)
+{
+    LONG widthBytes = (LONG)(width * 4);
+
+    // Decoders align height to macroblock boundaries:
+    //   H.264 = 16,  HEVC/VP9/AV1 can be 32 or 64
+    // Try each: if bufLen divides evenly by aligned height
+    // AND the resulting stride is sane (>= widthBytes, not absurdly padded),
+    // that's the real stride.
+    UINT32 alignments[] = { 16, 32, 64 };
+
+    for (UINT32 align : alignments)
+    {
+        UINT32 alignedH = (height + align - 1) & ~(align - 1);
+        if (alignedH != height && (bufLen % alignedH) == 0)
+        {
+            LONG candidate = (LONG)(bufLen / alignedH);
+            if (candidate >= widthBytes && candidate <= widthBytes + 256)
+                return candidate;
+        }
+    }
+
+    // Try exact height (no macroblock padding)
+    if (height > 0 && (bufLen % height) == 0)
+    {
+        LONG candidate = (LONG)(bufLen / height);
+        if (candidate >= widthBytes && candidate <= widthBytes + 256)
+            return candidate;
+    }
+
+    // Last resort
+    return widthBytes;
+}
+
 // ============================================================================
 // GLOBAL STATE
 // ============================================================================
-// Media Foundation reader (shared between audio + video decode threads)
 static IMFSourceReader* g_pReader = nullptr;
-static std::mutex        g_readerMutex;          // protects g_pReader calls
-// Video info
+static std::mutex        g_readerMutex;
+
 static UINT32  g_width = 0;
 static UINT32  g_height = 0;
-static UINT32  g_videoStride = 0;
+static std::atomic<LONG> g_videoStride{ 0 };
 static double  g_duration = 0.0;
 static bool    g_hasVideo = false;
 static bool    g_hasAudio = false;
-// Playback control (atomic for cross-thread safety)
-static std::atomic<int>    g_status{ 0 };     // 0=idle 1=playing 2=paused 3=ended
+
+static std::atomic<int>    g_status{ 0 };
 static std::atomic<bool>   g_loop{ false };
 static std::atomic<double> g_volume{ 1.0 };
 static std::atomic<double> g_position{ 0.0 };
-// Frame buffer
-static std::vector<BYTE>   g_frontFrame;         // GM reads from here
+
+static std::vector<BYTE>   g_frontFrame;
 static std::mutex          g_frameMutex;
 static void* g_targetBuffer = nullptr;
-// Master clock — driven by total audio bytes consumed by WASAPI
-static std::atomic<int64_t> g_audioBytesSent{ 0 }; // bytes pushed to WASAPI
+
+static std::atomic<int64_t> g_audioBytesSent{ 0 };
 static UINT32  g_wasapiSampleRate = 0;
 static UINT32  g_wasapiChannels = 0;
-static UINT32  g_wasapiBytesPerFrame = 0;         // nBlockAlign
-// Seek support
+static UINT32  g_wasapiBytesPerFrame = 0;
+
 static std::atomic<bool>   g_seekRequested{ false };
 static std::atomic<double> g_seekTarget{ 0.0 };
 static std::mutex          g_seekMutex;
 static std::condition_variable g_seekCV;
-// Playback start offset (for seek + pause resume)
-static std::atomic<double> g_clockOffset{ 0.0 };    // seconds offset after seek
+
+static std::atomic<double> g_clockOffset{ 0.0 };
 static std::atomic<int64_t> g_audioBytesSentAtResume{ 0 };
-// Audio ring buffer
+
 static AudioRingBuffer    g_audioRing;
 static UINT32  g_audioSampleRate = 0;
 static UINT32  g_audioChannels = 0;
 static std::atomic<bool> g_audioSeekSync{ false };
-// WASAPI
+
 static IMMDeviceEnumerator* g_pEnumerator = nullptr;
 static IMMDevice* g_pDevice = nullptr;
 static IAudioClient* g_pAudioClient = nullptr;
 static IAudioRenderClient* g_pRenderClient = nullptr;
 static UINT32               g_wasapiBufSize = 0;
 static WAVEFORMATEX* g_pWasapiFmt = nullptr;
-// Threads
+
 static std::thread* g_audioDecodeThread = nullptr;
 static std::thread* g_videoDecodeThread = nullptr;
 static HANDLE       g_hWasapiThread = nullptr;
@@ -151,6 +184,9 @@ static std::atomic<bool> g_seekFlushing{ false };
 static std::mutex              g_seekFlushMutex;
 static std::condition_variable g_seekFlushCV;
 static std::atomic<bool>       g_wasapiIdle{ false };
+
+static bool g_strideLogged = false;
+
 // ============================================================================
 // HELPERS
 // ============================================================================
@@ -174,26 +210,24 @@ static std::wstring NormalizePath(const std::wstring& p)
     }
     return c;
 }
+
 // ============================================================================
-// MASTER CLOCK — based on audio bytes consumed
+// MASTER CLOCK
 // ============================================================================
 static double GetMasterClock()
 {
     if (!g_hasAudio || g_wasapiBytesPerFrame == 0 || g_wasapiSampleRate == 0)
-    {
-        // No audio: fall back to wall clock (set elsewhere)
         return g_position.load();
-    }
     int64_t bytesSent = g_audioBytesSent.load() - g_audioBytesSentAtResume.load();
     double secondsOfAudio = (double)bytesSent / (double)(g_wasapiSampleRate * g_wasapiBytesPerFrame);
     return g_clockOffset.load() + secondsOfAudio;
 }
+
 // ============================================================================
 // WASAPI
 // ============================================================================
 static void StopWASAPI()
 {
-    // thread is stopped via g_threadsRunning flag externally
     if (g_hWasapiThread)
     {
         WaitForSingleObject(g_hWasapiThread, 3000);
@@ -209,6 +243,7 @@ static void StopWASAPI()
     g_wasapiChannels = 0;
     g_wasapiBytesPerFrame = 0;
 }
+
 static DWORD WINAPI WasapiThreadProc(LPVOID)
 {
     DWORD taskIndex = 0;
@@ -226,13 +261,11 @@ static DWORD WINAPI WasapiThreadProc(LPVOID)
         {
             if (g_seekFlushing.load())
             {
-                // Confirma que está idle e notifica o video thread
                 {
                     std::lock_guard<std::mutex> lk(g_seekFlushMutex);
                     g_wasapiIdle.store(true);
                 }
                 g_seekFlushCV.notify_all();
-                // Fica parado até o seek terminar
                 while (g_seekFlushing.load() && g_threadsRunning.load())
                     Sleep(1);
                 g_wasapiIdle.store(false);
@@ -294,11 +327,10 @@ static bool StartWASAPI()
     if (FAILED(hr)) return false;
     hr = g_pAudioClient->GetMixFormat(&g_pWasapiFmt);
     if (FAILED(hr)) return false;
-    // Store WASAPI format info for clock calculations
     g_wasapiSampleRate = g_pWasapiFmt->nSamplesPerSec;
     g_wasapiChannels = g_pWasapiFmt->nChannels;
     g_wasapiBytesPerFrame = g_pWasapiFmt->nBlockAlign;
-    REFERENCE_TIME bufDur = 500000; // 50ms buffer
+    REFERENCE_TIME bufDur = 500000;
     hr = g_pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, bufDur, 0, g_pWasapiFmt, nullptr);
     if (FAILED(hr)) return false;
     hr = g_pAudioClient->GetBufferSize(&g_wasapiBufSize);
@@ -313,40 +345,43 @@ static bool StartWASAPI()
 }
 
 // ============================================================================
-// AUDIO DECODE THREAD — self-throttled, feeds ring buffer
+// AUDIO DECODE THREAD
 // ============================================================================
 static void AudioDecodeThreadProc()
 {
+    bool draining = false;
+    LONGLONG drainUntil = 0;
+
     while (g_threadsRunning.load())
     {
-        // Only decode while playing
         if (g_status.load() != 1)
         {
             Sleep(10);
             continue;
         }
 
-        // ===== SINCRONIZAÇÃO DE SEEK =====
-        // Se seek está em andamento, aguarda ser notificado
         if (g_seekRequested.load() || g_seekFlushing.load())
         {
+            if (g_seekRequested.load())
+            {
+                drainUntil = (LONGLONG)(g_seekTarget.load() * 10000000.0);
+                draining = true;
+            }
             Sleep(1);
-            continue; // Seek em progresso, aguarda
+            continue;
         }
 
-        // Throttle: keep ~300ms of audio buffered, no more
-        size_t bytesPerSecond = (size_t)g_audioSampleRate * g_audioChannels * 4; // float32
-        size_t maxBuffered = bytesPerSecond * 3 / 10; // 300ms
-        if (g_audioRing.Count() >= maxBuffered)
+        size_t bytesPerSecond = (size_t)g_audioSampleRate * g_audioChannels * 4;
+        size_t maxBuffered = bytesPerSecond * 3 / 10;
+        if (!draining && g_audioRing.Count() >= maxBuffered)
         {
             Sleep(5);
             continue;
         }
-        // Read one audio sample from MF
+
         std::lock_guard<std::mutex> readerLock(g_readerMutex);
         if (!g_pReader) break;
 
-        // Double-check seek flag dentro do lock - proteção extra
         if (g_seekRequested.load() || g_seekFlushing.load())
             continue;
 
@@ -356,15 +391,29 @@ static void AudioDecodeThreadProc()
         HRESULT hr = g_pReader->ReadSample(
             (DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM,
             0, &streamIndex, &flags, &timestamp, &pSample);
+
         if (FAILED(hr) || (flags & MF_SOURCE_READERF_ENDOFSTREAM))
         {
             if (pSample) pSample->Release();
-            // Audio ended — let video thread handle looping/end
             Sleep(20);
             continue;
         }
+
         if (pSample)
         {
+            if (draining)
+            {
+                if (timestamp < drainUntil)
+                {
+                    pSample->Release();
+                    continue;
+                }
+                else
+                {
+                    draining = false;
+                }
+            }
+
             IMFMediaBuffer* pBuf = nullptr;
             if (SUCCEEDED(pSample->ConvertToContiguousBuffer(&pBuf)))
             {
@@ -372,7 +421,6 @@ static void AudioDecodeThreadProc()
                 DWORD maxLen = 0, curLen = 0;
                 if (SUCCEEDED(pBuf->Lock(&pData, &maxLen, &curLen)))
                 {
-                    // Mais uma verificação de seek antes de escrever no buffer
                     if (!g_seekRequested.load() && !g_seekFlushing.load())
                         g_audioRing.Write(pData, curLen);
                     pBuf->Unlock();
@@ -385,7 +433,7 @@ static void AudioDecodeThreadProc()
 }
 
 // ============================================================================
-// VIDEO DECODE THREAD — paces frames to master clock
+// VIDEO DECODE THREAD
 // ============================================================================
 static void VideoDecodeThreadProc()
 {
@@ -413,11 +461,9 @@ static void VideoDecodeThreadProc()
             double seekTo = g_seekTarget.load();
             seekTo = (std::max)(0.0, (std::min)(seekTo, g_duration));
 
-            // ===== FASE 1: Preparação - Parar todos os threads =====
             g_wasapiIdle.store(false);
             g_seekFlushing.store(true);
 
-            // Aguarda WASAPI thread confirmar que parou
             if (g_hasAudio && g_hWasapiThread)
             {
                 std::unique_lock<std::mutex> lk(g_seekFlushMutex);
@@ -426,14 +472,11 @@ static void VideoDecodeThreadProc()
                     });
             }
 
-            // Pequeno delay para AudioDecodeThread perceber a flag e parar
             Sleep(10);
 
-            // ===== FASE 2: Execução - Flush seguro com lock exclusivo =====
             {
                 std::lock_guard<std::mutex> readerLock(g_readerMutex);
 
-                // Mais verificação de segurança
                 if (!g_pReader)
                 {
                     g_seekFlushing.store(false);
@@ -450,30 +493,19 @@ static void VideoDecodeThreadProc()
                 PropVariantClear(&var);
                 if (SUCCEEDED(hr))
                 {
-                    // Limpa estado de áudio com cuidado
                     g_audioRing.Clear();
-
-                    // Clock reset - CRÍTICO para sincronia
                     g_clockOffset.store(seekTo);
                     g_audioBytesSentAtResume.store(g_audioBytesSent.load());
                     g_position.store(seekTo);
-
-                    // Wall clock reset para vídeos sem áudio
                     wallClockOffset = seekTo;
                     QueryPerformanceCounter(&wallClockStart);
                 }
             }
 
-            // ===== FASE 3: Finalização - Retomar threads =====
             g_seekFlushing.store(false);
-
-            // Pequeno delay para WASAPI retomar primeiro
             Sleep(5);
-
-            // Só agora sinaliza que seek terminou
             g_seekRequested.store(false);
             g_seekCV.notify_all();
-
             continue;
         }
 
@@ -506,7 +538,7 @@ static void VideoDecodeThreadProc()
                 {
                     PROPVARIANT var;
                     PropVariantInit(&var);
-                    var.vt = VT_I8;         // <-- ADICIONAR ESTA LINHA
+                    var.vt = VT_I8;
                     var.hVal.QuadPart = 0;
                     g_pReader->SetCurrentPosition(GUID_NULL, var);
                     PropVariantClear(&var);
@@ -554,66 +586,109 @@ static void VideoDecodeThreadProc()
                 continue;
             }
 
+            // ============================================================
+            // FRAME COPY
+            // ============================================================
             IMFMediaBuffer* pBuf = nullptr;
-            if (SUCCEEDED(pSample->ConvertToContiguousBuffer(&pBuf)))
+            HRESULT hrBuf = pSample->GetBufferByIndex(0, &pBuf);
+            if (FAILED(hrBuf))
+                hrBuf = pSample->ConvertToContiguousBuffer(&pBuf);
+
+            if (SUCCEEDED(hrBuf) && pBuf)
             {
                 BYTE* pData = nullptr;
-                DWORD curLen = 0;
-                if (SUCCEEDED(pBuf->Lock(&pData, nullptr, &curLen)))
+                LONG   stride = 0;
+                BOOL   locked2D = FALSE;
+                DWORD  lockedLen = 0;
+                IMF2DBuffer* p2D = nullptr;
+
+                // PATH 1: Lock2D
+                if (SUCCEEDED(pBuf->QueryInterface(IID_PPV_ARGS(&p2D))))
+                {
+                    if (SUCCEEDED(p2D->Lock2D(&pData, &stride)))
+                    {
+                        locked2D = TRUE;
+                    }
+                    else
+                    {
+                        p2D->Release();
+                        p2D = nullptr;
+                    }
+                }
+
+                // PATH 2: Lock1D with macroblock-aware stride
+                if (!locked2D)
+                {
+                    if (SUCCEEDED(pBuf->Lock(&pData, nullptr, &lockedLen)))
+                    {
+                        stride = ComputeStrideFromBuffer(lockedLen, g_width, g_height);
+                    }
+                    else
+                    {
+                        pData = nullptr;
+                    }
+                }
+
+                // DEBUG (once per file)
+                if (pData && !g_strideLogged)
+                {
+                    g_strideLogged = true;
+                    UINT32 mbHeight = (g_height + 15) & ~15;
+                    char dbg[512];
+                    if (locked2D)
+                    {
+                        sprintf_s(dbg,
+                            "[TinyROLL] FRAME: Lock2D OK, pitch=%d, width*4=%u\n",
+                            stride, g_width * 4);
+                    }
+                    else
+                    {
+                        sprintf_s(dbg,
+                            "[TinyROLL] FRAME: Lock1D, bufLen=%u, stride=%d, "
+                            "width*4=%u, h=%u, mbH=%u, bufLen/mbH=%u\n",
+                            lockedLen, stride, g_width * 4,
+                            g_height, mbHeight,
+                            mbHeight > 0 ? lockedLen / mbHeight : 0);
+                    }
+                    OutputDebugStringA(dbg);
+                }
+
+                // COPY PIXELS (only g_height rows — skip macroblock padding rows)
+                if (pData)
                 {
                     std::lock_guard<std::mutex> lock(g_frameMutex);
 
-                    // ===== HEURÍSTICA FINAL =====
-                    // Compara MFstride com calcStride. Se tiver mais de 10% diferença,
-                    // o calcStride tem padding real de codec.
+                    LONG absStride = (stride < 0) ? -stride : stride;
+                    BOOL bottomUp = (stride < 0);
 
-                    UINT32 srcStride = g_width * 4;  // fallback
-
-                    if (g_videoStride > 0 && g_height > 0 && curLen > 0)
-                    {
-                        UINT32 calcStride = curLen / g_height;
-
-                        // Heurística: se calcStride for >10% maior que MFstride,
-                        // o buffer real tem padding de codec (como 854→864)
-                        double ratio = (double)calcStride / (double)g_videoStride;
-
-                        if (ratio > 1.01 && calcStride >= g_width * 4 && calcStride <= g_width * 16)
-                        {
-                            // Padding real detectado
-                            srcStride = calcStride;
-                        }
-                        else
-                        {
-                            // MFstride é mais confiável
-                            if (g_videoStride >= g_width * 4 && g_videoStride <= g_width * 16)
-                                srcStride = g_videoStride;
-                        }
-                    }
-                    else if (g_height > 0 && curLen > 0)
-                    {
-                        // Sem MFstride, usa calcStride
-                        UINT32 calcStride = curLen / g_height;
-                        if (calcStride >= g_width * 4 && calcStride <= g_width * 16)
-                            srcStride = calcStride;
-                    }
-
-                    // Copia linha por linha
                     for (UINT32 row = 0; row < g_height; row++)
                     {
-                        BYTE* srcRow = pData + row * srcStride;
-                        BYTE* dstRow = g_frontFrame.data() + row * g_width * 4;
+                        UINT32 srcRow = bottomUp ? (g_height - 1 - row) : row;
+                        BYTE* src = pData + (size_t)srcRow * absStride;
+                        BYTE* dst = g_frontFrame.data() + (size_t)row * g_width * 4;
 
                         for (UINT32 col = 0; col < g_width; col++)
                         {
                             size_t s = col * 4;
-                            dstRow[s + 0] = srcRow[s + 2]; // R
-                            dstRow[s + 1] = srcRow[s + 1]; // G
-                            dstRow[s + 2] = srcRow[s + 0]; // B
-                            dstRow[s + 3] = 255;           // A
+                            dst[s + 0] = src[s + 2]; // B→R
+                            dst[s + 1] = src[s + 1]; // G
+                            dst[s + 2] = src[s + 0]; // R→B
+                            dst[s + 3] = 255;        // A
                         }
                     }
+                }
+
+                // UNLOCK
+                if (locked2D)
+                {
+                    p2D->Unlock2D();
+                    p2D->Release();
+                }
+                else if (pData)
+                {
                     pBuf->Unlock();
                 }
+
                 pBuf->Release();
             }
             pSample->Release();
@@ -629,23 +704,20 @@ static void StartAllThreads()
 {
     if (g_threadsRunning.load()) return;
     g_threadsRunning.store(true);
-    // WASAPI render thread
     if (g_hasAudio && g_pAudioClient)
     {
         g_hWasapiThread = CreateThread(nullptr, 0, WasapiThreadProc, nullptr, 0, nullptr);
         g_pAudioClient->Start();
     }
-    // Audio decode thread
     if (g_hasAudio)
         g_audioDecodeThread = new std::thread(AudioDecodeThreadProc);
-    // Video decode thread
     if (g_hasVideo)
         g_videoDecodeThread = new std::thread(VideoDecodeThreadProc);
 }
+
 static void StopAllThreads()
 {
     g_threadsRunning.store(false);
-    // Wake up anything waiting on seek
     g_seekCV.notify_all();
     if (g_audioDecodeThread)
     {
@@ -661,6 +733,7 @@ static void StopAllThreads()
     }
     StopWASAPI();
 }
+
 // ============================================================================
 // CLOSE / CLEANUP
 // ============================================================================
@@ -682,13 +755,14 @@ static void CloseReader()
     g_audioBytesSentAtResume.store(0);
     g_audioSampleRate = 0;
     g_audioChannels = 0;
-    g_videoStride = 0;  // Adicionar se não tiver
+    g_videoStride.store(0);
     g_seekFlushing.store(false);
     g_wasapiIdle.store(false);
+    g_strideLogged = false;
 }
 
 // ============================================================================
-// CONFIGURE READER — matches MF audio output to WASAPI format
+// CONFIGURE READER
 // ============================================================================
 static bool ConfigureReader(IMFSourceReader* pReader)
 {
@@ -708,14 +782,22 @@ static bool ConfigureReader(IMFSourceReader* pReader)
             if (SUCCEEDED(pReader->GetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, &pOut)))
             {
                 MFGetAttributeSize(pOut, MF_MT_FRAME_SIZE, &g_width, &g_height);
-                // ✅ Capturar o stride real do tipo de mídia
-                pOut->GetUINT32(MF_MT_DEFAULT_STRIDE, &g_videoStride);
-                // Fallback: calcular se não disponível
-                if (g_videoStride == 0)
-                    g_videoStride = g_width * 4;
+
+                UINT32 uStride = 0;
+                hr = pOut->GetUINT32(MF_MT_DEFAULT_STRIDE, &uStride);
+                if (SUCCEEDED(hr))
+                    g_videoStride.store((LONG)(INT32)uStride);
+                else
+                {
+                    LONG lStride = 0;
+                    hr = MFGetStrideForBitmapInfoHeader(
+                        MFVideoFormat_RGB32.Data1, g_width, &lStride);
+                    g_videoStride.store(SUCCEEDED(hr) ? lStride : (LONG)(g_width * 4));
+                }
 
                 char dbg[256];
-                sprintf_s(dbg, "[TinyROLL] Video: %ux%u, stride=%u\n", g_width, g_height, g_videoStride);
+                sprintf_s(dbg, "[TinyROLL] Video: %ux%u, default_stride=%d\n",
+                    g_width, g_height, g_videoStride.load());
                 OutputDebugStringA(dbg);
 
                 pOut->Release();
@@ -725,11 +807,10 @@ static bool ConfigureReader(IMFSourceReader* pReader)
         }
         else
         {
-            // No video stream — that's OK for audio-only files
             g_hasVideo = false;
         }
     }
-    // ---- Audio — match WASAPI format exactly ----
+    // ---- Audio ----
     {
         IMFMediaType* pType = nullptr;
         if (g_pWasapiFmt && SUCCEEDED(MFCreateMediaType(&pType)))
@@ -749,7 +830,6 @@ static bool ConfigureReader(IMFSourceReader* pReader)
                 g_hasAudio = true;
                 g_audioSampleRate = g_pWasapiFmt->nSamplesPerSec;
                 g_audioChannels = g_pWasapiFmt->nChannels;
-                // Ring buffer: ~2 seconds of audio
                 size_t ringSize = (size_t)g_audioSampleRate * g_audioChannels * 4 * 2;
                 g_audioRing.Init(ringSize);
                 char dbg[256];
@@ -760,7 +840,6 @@ static bool ConfigureReader(IMFSourceReader* pReader)
         }
         if (!g_hasAudio)
         {
-            // Try fallback: let MF pick its own float format
             IMFMediaType* pFallback = nullptr;
             if (SUCCEEDED(MFCreateMediaType(&pFallback)))
             {
@@ -787,7 +866,6 @@ static bool ConfigureReader(IMFSourceReader* pReader)
     }
     if (!g_hasVideo && !g_hasAudio)
         return false;
-    // Duration
     PROPVARIANT var;
     PropVariantInit(&var);
     if (SUCCEEDED(pReader->GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE, MF_PD_DURATION, &var))
@@ -796,9 +874,10 @@ static bool ConfigureReader(IMFSourceReader* pReader)
         g_duration = (double)var.uhVal.QuadPart / 10000000.0;
     }
     PropVariantClear(&var);
-    OutputDebugStringA("[TinyROLL] ConfigureReader OK — autonomous v6\n");
+    OutputDebugStringA("[TinyROLL] ConfigureReader OK — autonomous v9\n");
     return true;
 }
+
 // ============================================================================
 // PUBLIC API
 // ============================================================================
@@ -807,7 +886,6 @@ TINYROLL_API double DLL_Video_Open(const char* path_utf8)
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     MFStartup(MF_VERSION);
     CloseReader();
-    // Start WASAPI FIRST so g_pWasapiFmt is available for ConfigureReader
     StartWASAPI();
     std::wstring path = NormalizePath(Utf8ToWString(path_utf8));
     OutputDebugStringW((L"[TinyROLL] Opening: " + path + L"\n").c_str());
@@ -831,13 +909,13 @@ TINYROLL_API double DLL_Video_Open(const char* path_utf8)
         return 0.0;
     }
     g_pReader = pReader;
-    g_status.store(2); // paused, ready to play
+    g_status.store(2);
     return 1.0;
 }
+
 TINYROLL_API double DLL_Video_Play()
 {
     if (!g_pReader) return 0.0;
-    // If ended, seek to start
     if (g_status.load() == 3)
     {
         std::lock_guard<std::mutex> readerLock(g_readerMutex);
@@ -852,36 +930,32 @@ TINYROLL_API double DLL_Video_Play()
         g_clockOffset.store(0.0);
         g_audioBytesSentAtResume.store(g_audioBytesSent.load());
     }
-    // If paused, resume clock from current position
     if (g_status.load() == 2)
     {
         g_clockOffset.store(g_position.load());
         g_audioBytesSentAtResume.store(g_audioBytesSent.load());
     }
-    g_status.store(1); // playing
-    // Start threads if not already running
+    g_status.store(1);
     StartAllThreads();
     OutputDebugStringA("[TinyROLL] PLAYING — autonomous threads active\n");
     return 1.0;
 }
+
 TINYROLL_API double DLL_Video_Pause()
 {
     if (!g_pReader) return 0.0;
     if (g_status.load() == 1)
-    {
-        // Snapshot current time before pausing
         g_position.store(GetMasterClock());
-    }
     g_status.store(2);
     OutputDebugStringA("[TinyROLL] PAUSED\n");
     return 1.0;
 }
+
 TINYROLL_API double DLL_Video_Seek(double seconds)
 {
     if (!g_pReader) return 0.0;
     g_seekTarget.store(seconds);
     g_seekRequested.store(true);
-    // Wait for video thread to process the seek (with timeout)
     if (g_threadsRunning.load())
     {
         std::unique_lock<std::mutex> lk(g_seekMutex);
@@ -891,7 +965,6 @@ TINYROLL_API double DLL_Video_Seek(double seconds)
     }
     else
     {
-        // Threads not running, do seek directly
         seconds = (std::max)(0.0, (std::min)(seconds, g_duration));
         std::lock_guard<std::mutex> readerLock(g_readerMutex);
         PROPVARIANT var;
@@ -908,6 +981,7 @@ TINYROLL_API double DLL_Video_Seek(double seconds)
     }
     return 1.0;
 }
+
 TINYROLL_API double DLL_Video_SetLoop(double enabled)
 {
     g_loop.store(enabled != 0.0);
@@ -957,8 +1031,9 @@ TINYROLL_API double DLL_Video_GetPosition() { return g_position.load(); }
 TINYROLL_API double DLL_Video_GetStatus() { return (double)g_status.load(); }
 TINYROLL_API double DLL_Video_HasAudio() { return g_hasAudio ? 1.0 : 0.0; }
 TINYROLL_API double DLL_Video_HasVideo() { return g_hasVideo ? 1.0 : 0.0; }
+
 // ============================================================================
-// THUMBNAIL / UTILITY FUNCTIONS (unchanged)
+// THUMBNAIL / UTILITY FUNCTIONS
 // ============================================================================
 static bool SaveBitmapAsPNG(HBITMAP hBitmap, const std::wstring& outputPath)
 {
@@ -989,6 +1064,7 @@ static bool SaveBitmapAsPNG(HBITMAP hBitmap, const std::wstring& outputPath)
     if (pFactory)  pFactory->Release();
     return success;
 }
+
 static bool TryShellThumbnail(const std::wstring& videoPath, const std::wstring& outputPath)
 {
     IShellItem* pItem = nullptr;
@@ -1008,6 +1084,7 @@ static bool TryShellThumbnail(const std::wstring& videoPath, const std::wstring&
     if (pItem)    pItem->Release();
     return success;
 }
+
 static bool TryMFThumbnail(const std::wstring& videoPath, const std::wstring& outputPath)
 {
     IMFSourceReader* pReader = nullptr;
@@ -1078,6 +1155,7 @@ static bool TryMFThumbnail(const std::wstring& videoPath, const std::wstring& ou
     if (pReader) pReader->Release();
     return success;
 }
+
 TINYROLL_API double DLL_GetFileSize(const char* filepath_utf8)
 {
     std::wstring filepath = NormalizePath(Utf8ToWString(filepath_utf8));
@@ -1089,6 +1167,7 @@ TINYROLL_API double DLL_GetFileSize(const char* filepath_utf8)
     size.LowPart = attrs.nFileSizeLow;
     return (double)size.QuadPart;
 }
+
 TINYROLL_API double DLL_ParseThumbs(const char* folder_utf8)
 {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -1127,6 +1206,7 @@ TINYROLL_API double DLL_ParseThumbs(const char* folder_utf8)
     CoUninitialize();
     return (double)count;
 }
+
 TINYROLL_API double DLL_GetVideoDuration(const char* filepath_utf8)
 {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
