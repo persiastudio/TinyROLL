@@ -104,6 +104,7 @@ static std::mutex        g_readerMutex;          // protects g_pReader calls
 // Video info
 static UINT32  g_width = 0;
 static UINT32  g_height = 0;
+static UINT32  g_videoStride = 0;
 static double  g_duration = 0.0;
 static bool    g_hasVideo = false;
 static bool    g_hasAudio = false;
@@ -133,6 +134,7 @@ static std::atomic<int64_t> g_audioBytesSentAtResume{ 0 };
 static AudioRingBuffer    g_audioRing;
 static UINT32  g_audioSampleRate = 0;
 static UINT32  g_audioChannels = 0;
+static std::atomic<bool> g_audioSeekSync{ false };
 // WASAPI
 static IMMDeviceEnumerator* g_pEnumerator = nullptr;
 static IMMDevice* g_pDevice = nullptr;
@@ -309,6 +311,7 @@ static bool StartWASAPI()
     OutputDebugStringA(dbg);
     return true;
 }
+
 // ============================================================================
 // AUDIO DECODE THREAD — self-throttled, feeds ring buffer
 // ============================================================================
@@ -322,12 +325,15 @@ static void AudioDecodeThreadProc()
             Sleep(10);
             continue;
         }
-        // Handle seek
-        if (g_seekRequested.load())
+
+        // ===== SINCRONIZAÇÃO DE SEEK =====
+        // Se seek está em andamento, aguarda ser notificado
+        if (g_seekRequested.load() || g_seekFlushing.load())
         {
-            Sleep(5);
-            continue; // seek is handled in video thread which resets both streams
+            Sleep(1);
+            continue; // Seek em progresso, aguarda
         }
+
         // Throttle: keep ~300ms of audio buffered, no more
         size_t bytesPerSecond = (size_t)g_audioSampleRate * g_audioChannels * 4; // float32
         size_t maxBuffered = bytesPerSecond * 3 / 10; // 300ms
@@ -339,6 +345,11 @@ static void AudioDecodeThreadProc()
         // Read one audio sample from MF
         std::lock_guard<std::mutex> readerLock(g_readerMutex);
         if (!g_pReader) break;
+
+        // Double-check seek flag dentro do lock - proteção extra
+        if (g_seekRequested.load() || g_seekFlushing.load())
+            continue;
+
         DWORD flags = 0, streamIndex = 0;
         LONGLONG timestamp = 0;
         IMFSample* pSample = nullptr;
@@ -361,7 +372,9 @@ static void AudioDecodeThreadProc()
                 DWORD maxLen = 0, curLen = 0;
                 if (SUCCEEDED(pBuf->Lock(&pData, &maxLen, &curLen)))
                 {
-                    g_audioRing.Write(pData, curLen);
+                    // Mais uma verificação de seek antes de escrever no buffer
+                    if (!g_seekRequested.load() && !g_seekFlushing.load())
+                        g_audioRing.Write(pData, curLen);
                     pBuf->Unlock();
                 }
                 pBuf->Release();
@@ -370,6 +383,7 @@ static void AudioDecodeThreadProc()
         }
     }
 }
+
 // ============================================================================
 // VIDEO DECODE THREAD — paces frames to master clock
 // ============================================================================
@@ -399,19 +413,35 @@ static void VideoDecodeThreadProc()
             double seekTo = g_seekTarget.load();
             seekTo = (std::max)(0.0, (std::min)(seekTo, g_duration));
 
+            // ===== FASE 1: Preparação - Parar todos os threads =====
             g_wasapiIdle.store(false);
             g_seekFlushing.store(true);
 
+            // Aguarda WASAPI thread confirmar que parou
             if (g_hasAudio && g_hWasapiThread)
             {
                 std::unique_lock<std::mutex> lk(g_seekFlushMutex);
-                g_seekFlushCV.wait_for(lk, std::chrono::milliseconds(100), [] {
+                g_seekFlushCV.wait_for(lk, std::chrono::milliseconds(200), [] {
                     return g_wasapiIdle.load();
                     });
             }
 
+            // Pequeno delay para AudioDecodeThread perceber a flag e parar
+            Sleep(10);
+
+            // ===== FASE 2: Execução - Flush seguro com lock exclusivo =====
             {
                 std::lock_guard<std::mutex> readerLock(g_readerMutex);
+
+                // Mais verificação de segurança
+                if (!g_pReader)
+                {
+                    g_seekFlushing.store(false);
+                    g_seekRequested.store(false);
+                    g_seekCV.notify_all();
+                    continue;
+                }
+
                 PROPVARIANT var;
                 PropVariantInit(&var);
                 var.vt = VT_I8;
@@ -420,18 +450,30 @@ static void VideoDecodeThreadProc()
                 PropVariantClear(&var);
                 if (SUCCEEDED(hr))
                 {
+                    // Limpa estado de áudio com cuidado
                     g_audioRing.Clear();
+
+                    // Clock reset - CRÍTICO para sincronia
                     g_clockOffset.store(seekTo);
                     g_audioBytesSentAtResume.store(g_audioBytesSent.load());
                     g_position.store(seekTo);
+
+                    // Wall clock reset para vídeos sem áudio
                     wallClockOffset = seekTo;
                     QueryPerformanceCounter(&wallClockStart);
                 }
             }
 
+            // ===== FASE 3: Finalização - Retomar threads =====
             g_seekFlushing.store(false);
+
+            // Pequeno delay para WASAPI retomar primeiro
+            Sleep(5);
+
+            // Só agora sinaliza que seek terminou
             g_seekRequested.store(false);
             g_seekCV.notify_all();
+
             continue;
         }
 
@@ -464,7 +506,6 @@ static void VideoDecodeThreadProc()
                 {
                     PROPVARIANT var;
                     PropVariantInit(&var);
-                    var.vt = VT_I8;
                     var.hVal.QuadPart = 0;
                     g_pReader->SetCurrentPosition(GUID_NULL, var);
                     PropVariantClear(&var);
@@ -521,20 +562,53 @@ static void VideoDecodeThreadProc()
                 {
                     std::lock_guard<std::mutex> lock(g_frameMutex);
 
-                    // Stride real = curLen / height — captura padding do codec (ex: 854 -> 864)
-                    UINT32 actualStride = (g_height > 0) ? (curLen / g_height) : (g_width * 4);
+                    // ===== HEURÍSTICA FINAL =====
+                    // Compara MFstride com calcStride. Se tiver mais de 10% diferença,
+                    // o calcStride tem padding real de codec.
 
+                    UINT32 srcStride = g_width * 4;  // fallback
+
+                    if (g_videoStride > 0 && g_height > 0 && curLen > 0)
+                    {
+                        UINT32 calcStride = curLen / g_height;
+
+                        // Heurística: se calcStride for >10% maior que MFstride,
+                        // o buffer real tem padding de codec (como 854→864)
+                        double ratio = (double)calcStride / (double)g_videoStride;
+
+                        if (ratio > 1.01 && calcStride >= g_width * 4 && calcStride <= g_width * 16)
+                        {
+                            // Padding real detectado
+                            srcStride = calcStride;
+                        }
+                        else
+                        {
+                            // MFstride é mais confiável
+                            if (g_videoStride >= g_width * 4 && g_videoStride <= g_width * 16)
+                                srcStride = g_videoStride;
+                        }
+                    }
+                    else if (g_height > 0 && curLen > 0)
+                    {
+                        // Sem MFstride, usa calcStride
+                        UINT32 calcStride = curLen / g_height;
+                        if (calcStride >= g_width * 4 && calcStride <= g_width * 16)
+                            srcStride = calcStride;
+                    }
+
+                    // Copia linha por linha
                     for (UINT32 row = 0; row < g_height; row++)
                     {
-                        BYTE* srcRow = pData + row * actualStride;
+                        BYTE* srcRow = pData + row * srcStride;
                         BYTE* dstRow = g_frontFrame.data() + row * g_width * 4;
+
                         for (UINT32 col = 0; col < g_width; col++)
                         {
                             size_t s = col * 4;
                             dstRow[s + 0] = srcRow[s + 2]; // R
                             dstRow[s + 1] = srcRow[s + 1]; // G
                             dstRow[s + 2] = srcRow[s + 0]; // B
-                            dstRow[s + 3] = 255;            // A
+                            dstRow[s + 3] = 255;           // A
                         }
                     }
                     pBuf->Unlock();
@@ -607,10 +681,11 @@ static void CloseReader()
     g_audioBytesSentAtResume.store(0);
     g_audioSampleRate = 0;
     g_audioChannels = 0;
-    g_seekFlushing.store(false);
+    g_videoStride = 0;  // Adicionar se não tiver
     g_seekFlushing.store(false);
     g_wasapiIdle.store(false);
 }
+
 // ============================================================================
 // CONFIGURE READER — matches MF audio output to WASAPI format
 // ============================================================================
@@ -632,9 +707,16 @@ static bool ConfigureReader(IMFSourceReader* pReader)
             if (SUCCEEDED(pReader->GetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, &pOut)))
             {
                 MFGetAttributeSize(pOut, MF_MT_FRAME_SIZE, &g_width, &g_height);
+                // ✅ Capturar o stride real do tipo de mídia
+                pOut->GetUINT32(MF_MT_DEFAULT_STRIDE, &g_videoStride);
+                // Fallback: calcular se não disponível
+                if (g_videoStride == 0)
+                    g_videoStride = g_width * 4;
+
                 char dbg[256];
-                sprintf_s(dbg, "[TinyROLL] Video: %ux%u\n", g_width, g_height);
+                sprintf_s(dbg, "[TinyROLL] Video: %ux%u, stride=%u\n", g_width, g_height, g_videoStride);
                 OutputDebugStringA(dbg);
+
                 pOut->Release();
             }
             size_t frameBytes = (size_t)g_width * g_height * 4;
