@@ -1,6 +1,6 @@
 {
   "$GMObject":"",
-  "%Name":"obj_troll_fsc",
+  "%Name":"obj_troll_loop",
   "eventList":[
     {"$GMEvent":"v1","%Name":"","collisionObjectId":null,"eventNum":0,"eventType":0,"isDnD":false,"name":"","resourceType":"GMEvent","resourceVersion":"2.0",},
     {"$GMEvent":"v1","%Name":"","collisionObjectId":null,"eventNum":0,"eventType":3,"isDnD":false,"name":"","resourceType":"GMEvent","resourceVersion":"2.0",},
@@ -9,7 +9,7 @@
     {"$GMEvent":"v1","%Name":"","collisionObjectId":null,"eventNum":11,"eventType":6,"isDnD":false,"name":"","resourceType":"GMEvent","resourceVersion":"2.0",},
   ],
   "managed":true,
-  "name":"obj_troll_fsc",
+  "name":"obj_troll_loop",
   "overriddenProperties":[],
   "parent":{
     "name":"TinyROLL",
@@ -37,8 +37,8 @@
   "resourceVersion":"2.0",
   "solid":false,
   "spriteId":{
-    "name":"spr_troll_fsc",
-    "path":"sprites/spr_troll_fsc/spr_troll_fsc.yy",
+    "name":"spr_troll_repeat",
+    "path":"sprites/spr_troll_repeat/spr_troll_repeat.yy",
   },
   "spriteMaskId":null,
   "visible":true,

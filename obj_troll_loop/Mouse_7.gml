@@ -1,0 +1,1 @@
+TROLL_CFG_VLoop = !TROLL_CFG_VLoop;
