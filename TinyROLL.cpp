@@ -145,6 +145,10 @@ static std::thread* g_audioDecodeThread = nullptr;
 static std::thread* g_videoDecodeThread = nullptr;
 static HANDLE       g_hWasapiThread = nullptr;
 static std::atomic<bool> g_threadsRunning{ false };
+static std::atomic<bool> g_seekFlushing{ false };
+static std::mutex              g_seekFlushMutex;
+static std::condition_variable g_seekFlushCV;
+static std::atomic<bool>       g_wasapiIdle{ false };
 // ============================================================================
 // HELPERS
 // ============================================================================
@@ -205,7 +209,6 @@ static void StopWASAPI()
 }
 static DWORD WINAPI WasapiThreadProc(LPVOID)
 {
-    // Boost thread priority for glitch-free audio
     DWORD taskIndex = 0;
     HANDLE hTask = nullptr;
     HMODULE hAvrt = LoadLibraryA("avrt.dll");
@@ -217,9 +220,25 @@ static DWORD WINAPI WasapiThreadProc(LPVOID)
     }
     while (g_threadsRunning.load())
     {
-        if (!g_pAudioClient || !g_pRenderClient || g_status.load() != 1)
+        if (g_seekFlushing.load() || !g_pAudioClient || !g_pRenderClient || g_status.load() != 1)
         {
-            Sleep(5);
+            if (g_seekFlushing.load())
+            {
+                // Confirma que está idle e notifica o video thread
+                {
+                    std::lock_guard<std::mutex> lk(g_seekFlushMutex);
+                    g_wasapiIdle.store(true);
+                }
+                g_seekFlushCV.notify_all();
+                // Fica parado até o seek terminar
+                while (g_seekFlushing.load() && g_threadsRunning.load())
+                    Sleep(1);
+                g_wasapiIdle.store(false);
+            }
+            else
+            {
+                Sleep(5);
+            }
             continue;
         }
         UINT32 padding = 0;
@@ -231,7 +250,6 @@ static DWORD WINAPI WasapiThreadProc(LPVOID)
         UINT32 bytesPerFrame = g_pWasapiFmt->nBlockAlign;
         UINT32 totalBytes = available * bytesPerFrame;
         size_t got = g_audioRing.Read(pData, totalBytes);
-        // Apply volume
         if (got > 0)
         {
             double vol = g_volume.load();
@@ -244,13 +262,10 @@ static DWORD WINAPI WasapiThreadProc(LPVOID)
                     fData[i] *= fvol;
             }
         }
-        // Silence-fill remainder
         if (got < totalBytes)
             memset(pData + got, 0, totalBytes - got);
         g_pRenderClient->ReleaseBuffer(available, 0);
-        // Track how many real bytes of audio we sent
         g_audioBytesSent.fetch_add((int64_t)got);
-        // Update position from audio clock
         g_position.store(GetMasterClock());
         Sleep(2);
     }
@@ -263,6 +278,7 @@ static DWORD WINAPI WasapiThreadProc(LPVOID)
     if (hAvrt) FreeLibrary(hAvrt);
     return 0;
 }
+
 static bool StartWASAPI()
 {
     if (g_pAudioClient) return true;
@@ -382,22 +398,38 @@ static void VideoDecodeThreadProc()
         {
             double seekTo = g_seekTarget.load();
             seekTo = (std::max)(0.0, (std::min)(seekTo, g_duration));
-            std::lock_guard<std::mutex> readerLock(g_readerMutex);
-            PROPVARIANT var;
-            PropVariantInit(&var);
-            var.vt = VT_I8;
-            var.hVal.QuadPart = (LONGLONG)(seekTo * 10000000.0);
-            HRESULT hr = g_pReader->SetCurrentPosition(GUID_NULL, var);
-            PropVariantClear(&var);
-            if (SUCCEEDED(hr))
+
+            g_wasapiIdle.store(false);
+            g_seekFlushing.store(true);
+
+            if (g_hasAudio && g_hWasapiThread)
             {
-                g_audioRing.Clear();
-                g_clockOffset.store(seekTo);
-                g_audioBytesSentAtResume.store(g_audioBytesSent.load());
-                g_position.store(seekTo);
-                wallClockOffset = seekTo;
-                QueryPerformanceCounter(&wallClockStart);
+                std::unique_lock<std::mutex> lk(g_seekFlushMutex);
+                g_seekFlushCV.wait_for(lk, std::chrono::milliseconds(100), [] {
+                    return g_wasapiIdle.load();
+                    });
             }
+
+            {
+                std::lock_guard<std::mutex> readerLock(g_readerMutex);
+                PROPVARIANT var;
+                PropVariantInit(&var);
+                var.vt = VT_I8;
+                var.hVal.QuadPart = (LONGLONG)(seekTo * 10000000.0);
+                HRESULT hr = g_pReader->SetCurrentPosition(GUID_NULL, var);
+                PropVariantClear(&var);
+                if (SUCCEEDED(hr))
+                {
+                    g_audioRing.Clear();
+                    g_clockOffset.store(seekTo);
+                    g_audioBytesSentAtResume.store(g_audioBytesSent.load());
+                    g_position.store(seekTo);
+                    wallClockOffset = seekTo;
+                    QueryPerformanceCounter(&wallClockStart);
+                }
+            }
+
+            g_seekFlushing.store(false);
             g_seekRequested.store(false);
             g_seekCV.notify_all();
             continue;
@@ -487,16 +519,23 @@ static void VideoDecodeThreadProc()
                 DWORD curLen = 0;
                 if (SUCCEEDED(pBuf->Lock(&pData, nullptr, &curLen)))
                 {
-                    // Escreve direto no frontFrame — sem double-buffer, sem Tick externo
                     std::lock_guard<std::mutex> lock(g_frameMutex);
-                    size_t pixels = (std::min)((size_t)curLen / 4, g_frontFrame.size() / 4);
-                    for (size_t i = 0; i < pixels; i++)
+
+                    // Stride real = curLen / height — captura padding do codec (ex: 854 -> 864)
+                    UINT32 actualStride = (g_height > 0) ? (curLen / g_height) : (g_width * 4);
+
+                    for (UINT32 row = 0; row < g_height; row++)
                     {
-                        size_t off = i * 4;
-                        g_frontFrame[off + 0] = pData[off + 2]; // R
-                        g_frontFrame[off + 1] = pData[off + 1]; // G
-                        g_frontFrame[off + 2] = pData[off + 0]; // B
-                        g_frontFrame[off + 3] = 255;             // A
+                        BYTE* srcRow = pData + row * actualStride;
+                        BYTE* dstRow = g_frontFrame.data() + row * g_width * 4;
+                        for (UINT32 col = 0; col < g_width; col++)
+                        {
+                            size_t s = col * 4;
+                            dstRow[s + 0] = srcRow[s + 2]; // R
+                            dstRow[s + 1] = srcRow[s + 1]; // G
+                            dstRow[s + 2] = srcRow[s + 0]; // B
+                            dstRow[s + 3] = 255;            // A
+                        }
                     }
                     pBuf->Unlock();
                 }
@@ -568,6 +607,9 @@ static void CloseReader()
     g_audioBytesSentAtResume.store(0);
     g_audioSampleRate = 0;
     g_audioChannels = 0;
+    g_seekFlushing.store(false);
+    g_seekFlushing.store(false);
+    g_wasapiIdle.store(false);
 }
 // ============================================================================
 // CONFIGURE READER — matches MF audio output to WASAPI format
