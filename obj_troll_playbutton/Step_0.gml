@@ -1,5 +1,5 @@
-if (krnl_check_blocking() || !krnl_box_get_active(krnl_guess_box(Box))){exit;}
 image_index = ThmGrID mod 3;
+if (krnl_check_blocking() || !krnl_box_get_active(krnl_guess_box(Box))){exit;}
 switch(TROLL_CFG_FScrn)
 {
     case 0: x = myX; y = myY; break;
