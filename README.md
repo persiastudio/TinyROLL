@@ -1,2 +1,2 @@
 TinyROLL - TinyBox OS Advanced Video Player
-Current version: 0.10 RC
+Current version: V0.11 Beta
